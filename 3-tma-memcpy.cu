@@ -19,12 +19,142 @@ typedef __nv_bfloat16 bf16;
 
 __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                          __grid_constant__ const CUtensorMap dest_tensor_map,
-                         const int N) {
-    /* TODO: your TMA memcpy kernel here... */
+                         const int total_cols, const int total_rows) {
+    constexpr int TILE_COLS = 128;
+    constexpr int TILE_ROWS = 64;
+    constexpr int TILE_ELEMS = TILE_COLS * TILE_ROWS;
+    constexpr uint32_t TILE_BYTES =
+        static_cast<uint32_t>(TILE_ELEMS * sizeof(bf16));
+
+    __shared__ alignas(128) bf16 smem_tiles[2][TILE_ELEMS];
+    __shared__ alignas(8) uint64_t mbarriers[2];
+
+    const int tiles_per_row =
+        (total_cols + TILE_COLS - 1) / TILE_COLS;
+    const int row_tiles = (total_rows + TILE_ROWS - 1) / TILE_ROWS;
+    const size_t total_tiles =
+        static_cast<size_t>(tiles_per_row) * static_cast<size_t>(row_tiles);
+
+    if (blockIdx.x >= total_tiles) {
+        return;
+    }
+
+    // Initialize barriers once per block.
+    if (threadIdx.x == 0) {
+        init_barrier(&mbarriers[0], 1);
+        init_barrier(&mbarriers[1], 1);
+    }
+    __syncthreads();
+    async_proxy_fence();
+
+    auto issue_tma_load = [&](size_t tile_idx, int buffer) {
+        const int tile_col = static_cast<int>(tile_idx % tiles_per_row);
+        const int tile_row = static_cast<int>(tile_idx / tiles_per_row);
+        const int c0 = tile_col * TILE_COLS;
+        const int c1 = tile_row * TILE_ROWS;
+        bf16 *smem_ptr = smem_tiles[buffer];
+        uint64_t *bar = &mbarriers[buffer];
+
+        expect_bytes_and_arrive(bar, TILE_BYTES);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_ptr, &tensor_map, c0, c1, bar);
+    };
+
+    int phase_parity[2] = {0, 0};
+    const size_t stride = gridDim.x;
+    size_t tile_idx = blockIdx.x;
+
+    if (threadIdx.x == 0) {
+        issue_tma_load(tile_idx, tile_idx & 1);
+    }
+    __syncthreads();
+
+    for (; tile_idx < total_tiles; tile_idx += stride) {
+        const int buffer = static_cast<int>(tile_idx & 1);
+        const int tile_col = static_cast<int>(tile_idx % tiles_per_row);
+        const int tile_row = static_cast<int>(tile_idx / tiles_per_row);
+        const int c0 = tile_col * TILE_COLS;
+        const int c1 = tile_row * TILE_ROWS;
+        bf16 *smem_ptr = smem_tiles[buffer];
+        uint64_t *bar = &mbarriers[buffer];
+
+        if (threadIdx.x == 0) {
+            wait(bar, phase_parity[buffer]);
+            phase_parity[buffer] ^= 1;
+            cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, c0, c1,
+                                                     smem_ptr);
+            tma_commit_group();
+        }
+        __syncthreads();
+
+        const size_t next_tile = tile_idx + stride;
+        if (next_tile < total_tiles && threadIdx.x == 0) {
+            const int next_buffer = static_cast<int>(next_tile & 1);
+            issue_tma_load(next_tile, next_buffer);
+        }
+
+        if (threadIdx.x == 0) {
+            // Allow one outstanding commit group to keep the pipeline full.
+            tma_wait_until_pending<1>();
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        tma_wait_until_pending<0>();
+    }
 }
 
-void launch_tma_copy(bf16 *dest, bf16 *src, int N) {
-    /* TODO: your launch code here... */
+void launch_tma_copy(bf16 *dest, bf16 *src, int num_elements) {
+    constexpr int TILE_COLS = 128;
+    constexpr int TILE_ROWS = 64;
+
+    CUDA_CHECK(cuInit(0));
+
+    CUtensorMap src_map;
+    CUtensorMap dest_map;
+
+    const int cols = TILE_COLS;
+    const int rows = num_elements / cols;
+
+    const cuuint64_t globalDim[2] = {static_cast<cuuint64_t>(cols),
+                                     static_cast<cuuint64_t>(rows)};
+    const cuuint64_t globalStrides[1] = {
+        static_cast<cuuint64_t>(cols * sizeof(bf16))};
+    const cuuint32_t boxDim[2] = {static_cast<cuuint32_t>(TILE_COLS),
+                                  static_cast<cuuint32_t>(TILE_ROWS)};
+    const cuuint32_t elementStrides[2] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, src, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dest, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    int sm_count = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_count,
+                                      cudaDevAttrMultiProcessorCount, 0));
+
+    const int tiles_per_row =
+        (cols + TILE_COLS - 1) / TILE_COLS;
+    const int row_tiles = (rows + TILE_ROWS - 1) / TILE_ROWS;
+    const size_t total_tiles =
+        static_cast<size_t>(tiles_per_row) * static_cast<size_t>(row_tiles);
+
+    const int max_blocks = sm_count * 4;
+    const int grid_blocks =
+        static_cast<int>(std::min(total_tiles, static_cast<size_t>(max_blocks)));
+
+    dim3 block_dim(32);
+    dim3 grid_dim(grid_blocks);
+
+    tma_copy<<<grid_dim, block_dim>>>(src_map, dest_map, cols, rows);
 }
 
 /// <--- /your code here --->

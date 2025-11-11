@@ -19,8 +19,151 @@ typedef __nv_bfloat16 bf16;
 __global__ void
 tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
                        __grid_constant__ const CUtensorMap dest_tensor_map,
-                       const int N) {
-    /* TODO: your TMA memcpy kernel here... */
+                       const int total_elems) {
+    constexpr int TILE_COLS = 128;
+    constexpr int TILE_ROWS = 64;
+    constexpr int TILE_ELEMS = TILE_COLS * TILE_ROWS;
+    constexpr uint32_t TILE_BYTES =
+        static_cast<uint32_t>(TILE_ELEMS * sizeof(bf16));
+    constexpr int PIPE_DEPTH = 4;
+
+    const int total_cols = TILE_COLS;
+    const int total_rows = total_elems / total_cols;
+
+    const int tiles_per_row =
+        (total_cols + TILE_COLS - 1) / TILE_COLS; // == 1 with current params
+    const int row_tiles = (total_rows + TILE_ROWS - 1) / TILE_ROWS;
+    const size_t total_tiles =
+        static_cast<size_t>(tiles_per_row) * static_cast<size_t>(row_tiles);
+
+    if (blockIdx.x >= total_tiles) {
+        return;
+    }
+
+    extern __shared__ unsigned char shared_raw[];
+    uintptr_t base_ptr = reinterpret_cast<uintptr_t>(shared_raw);
+    base_ptr = (base_ptr + 127) & ~static_cast<uintptr_t>(127);
+    bf16 *smem_tiles = reinterpret_cast<bf16 *>(base_ptr);
+
+    uintptr_t after_tiles =
+        base_ptr + sizeof(bf16) * PIPE_DEPTH * static_cast<size_t>(TILE_ELEMS);
+    after_tiles = (after_tiles + 7) & ~static_cast<uintptr_t>(7);
+    uint64_t *mbarriers = reinterpret_cast<uint64_t *>(after_tiles);
+
+    uintptr_t after_barriers =
+        after_tiles + sizeof(uint64_t) * PIPE_DEPTH;
+    after_barriers = (after_barriers + 3) & ~static_cast<uintptr_t>(3);
+    volatile int *buffer_state = reinterpret_cast<volatile int *>(after_barriers);
+
+    uintptr_t after_state =
+        after_barriers + sizeof(int) * PIPE_DEPTH;
+    after_state = (after_state + 3) & ~static_cast<uintptr_t>(3);
+    unsigned long long *tile_index =
+        reinterpret_cast<unsigned long long *>(after_state);
+
+    uintptr_t after_index =
+        after_state + sizeof(unsigned long long) * PIPE_DEPTH;
+    after_index = (after_index + 3) & ~static_cast<uintptr_t>(3);
+    int *barrier_phase = reinterpret_cast<int *>(after_index);
+
+    const int warp_id = threadIdx.x / warpSize;
+    const int lane_id = threadIdx.x % warpSize;
+
+    if (warp_id == 0 && lane_id == 0) {
+        for (int i = 0; i < PIPE_DEPTH; ++i) {
+            init_barrier(&mbarriers[i], 1);
+            barrier_phase[i] = 0;
+            buffer_state[i] = 0;
+            tile_index[i] = 0ull;
+        }
+    }
+    __syncthreads();
+    async_proxy_fence();
+
+    const size_t stride = gridDim.x;
+    const size_t first_tile = blockIdx.x;
+
+    const unsigned long long tiles_for_block =
+        (total_tiles <= first_tile)
+            ? 0ull
+            : ((static_cast<unsigned long long>(total_tiles - first_tile) +
+                static_cast<unsigned long long>(stride) - 1ull) /
+               static_cast<unsigned long long>(stride));
+
+    if (tiles_for_block == 0) {
+        return;
+    }
+
+    if (warp_id == 0) {
+        size_t tile = first_tile;
+        unsigned long long issued = 0;
+        while (tile < total_tiles) {
+            const int buffer = static_cast<int>(issued % PIPE_DEPTH);
+            bf16 *buffer_ptr =
+                smem_tiles + buffer * static_cast<size_t>(TILE_ELEMS);
+            uint64_t *bar = &mbarriers[buffer];
+
+            if (lane_id == 0) {
+                while (buffer_state[buffer] != 0) {
+                }
+                const int tile_col =
+                    static_cast<int>(tile % static_cast<size_t>(tiles_per_row));
+                const int tile_row =
+                    static_cast<int>(tile / static_cast<size_t>(tiles_per_row));
+                tile_index[buffer] = static_cast<unsigned long long>(tile);
+
+                const int c0 = tile_col * TILE_COLS;
+                const int c1 = tile_row * TILE_ROWS;
+
+                expect_bytes_and_arrive(bar, TILE_BYTES);
+                cp_async_bulk_tensor_2d_global_to_shared(
+                    buffer_ptr, &tensor_map, c0, c1, bar);
+                __threadfence_block();
+                buffer_state[buffer] = 1;
+            }
+            issued++;
+            tile += stride;
+        }
+    } else if (warp_id == 1) {
+        unsigned long long consumed = 0;
+        while (consumed < tiles_for_block) {
+            const int buffer = static_cast<int>(consumed % PIPE_DEPTH);
+            bf16 *buffer_ptr =
+                smem_tiles + buffer * static_cast<size_t>(TILE_ELEMS);
+            uint64_t *bar = &mbarriers[buffer];
+
+            if (lane_id == 0) {
+                while (buffer_state[buffer] != 1) {
+                }
+                const unsigned long long tile =
+                    tile_index[buffer];
+                const int tile_col =
+                    static_cast<int>(tile % static_cast<unsigned long long>(tiles_per_row));
+                const int tile_row =
+                    static_cast<int>(tile / static_cast<unsigned long long>(tiles_per_row));
+                const int c0 = tile_col * TILE_COLS;
+                const int c1 = tile_row * TILE_ROWS;
+
+                const int phase = barrier_phase[buffer];
+                wait(bar, phase);
+                barrier_phase[buffer] = phase ^ 1;
+
+                cp_async_bulk_tensor_2d_shared_to_global(
+                    &dest_tensor_map, c0, c1, buffer_ptr);
+                tma_commit_group();
+                tma_wait_until_pending<1>();
+                __threadfence_block();
+                buffer_state[buffer] = 0;
+            }
+            consumed++;
+        }
+
+        if (lane_id == 0) {
+            tma_wait_until_pending<0>();
+        }
+    }
+
+    __syncthreads();
 }
 
 void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N) {
@@ -36,7 +179,79 @@ void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N) {
      * it with the maximum amount.
      */
 
-    /* TODO: your launch code here... */
+    constexpr int TILE_COLS = 128;
+    constexpr int TILE_ROWS = 64;
+    constexpr int PIPE_DEPTH = 4;
+    constexpr size_t TILE_ELEMS = static_cast<size_t>(TILE_COLS) * TILE_ROWS;
+
+    CUDA_CHECK(cuInit(0));
+
+    CUtensorMap src_map;
+    CUtensorMap dest_map;
+
+    const int cols = TILE_COLS;
+    const int rows = N / cols;
+
+    const cuuint64_t globalDim[2] = {static_cast<cuuint64_t>(cols),
+                                     static_cast<cuuint64_t>(rows)};
+    const cuuint64_t globalStrides[1] = {
+        static_cast<cuuint64_t>(cols * sizeof(bf16))};
+    const cuuint32_t boxDim[2] = {static_cast<cuuint32_t>(TILE_COLS),
+                                  static_cast<cuuint32_t>(TILE_ROWS)};
+    const cuuint32_t elementStrides[2] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, src, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dest, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    int sm_count = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_count,
+                                      cudaDevAttrMultiProcessorCount, 0));
+
+    int max_smem_optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_optin,
+                                      cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                      0));
+
+    size_t required_tiles_bytes =
+        sizeof(bf16) * TILE_ELEMS * PIPE_DEPTH;
+    size_t required_barriers_bytes =
+        ((required_tiles_bytes + 127) & ~static_cast<size_t>(127));
+    required_barriers_bytes =
+        ((required_barriers_bytes + sizeof(uint64_t) * PIPE_DEPTH + 7) &
+         ~static_cast<size_t>(7));
+    const size_t required_total =
+        max_smem_optin; // launch reserves maximum per requirement
+    (void)required_tiles_bytes;
+    (void)required_barriers_bytes;
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        tma_multiwarp_pipeline, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        max_smem_optin));
+
+    const int tiles_per_row =
+        (cols + TILE_COLS - 1) / TILE_COLS;
+    const int row_tiles = (rows + TILE_ROWS - 1) / TILE_ROWS;
+    const size_t total_tiles =
+        static_cast<size_t>(tiles_per_row) * static_cast<size_t>(row_tiles);
+
+    const int max_blocks = sm_count * 4;
+    const int grid_blocks =
+        static_cast<int>(std::min(total_tiles, static_cast<size_t>(max_blocks)));
+
+    dim3 block_dim(128);
+    dim3 grid_dim(grid_blocks);
+
+    tma_multiwarp_pipeline<<<grid_dim, block_dim, required_total>>>(
+        src_map, dest_map, N);
 }
 
 /// <--- /your code here --->
