@@ -22,12 +22,60 @@ typedef __nv_bfloat16 bf16;
 template <int TILE_M, int TILE_N>
 __global__ void single_tma_store(__grid_constant__ const CUtensorMap src_map,
                                  __grid_constant__ const CUtensorMap dest_map) {
-    /* TODO: your TMA store code here... */
+    __shared__ alignas(128) bf16 smem_tile[TILE_M * TILE_N];
+    __shared__ alignas(8) uint64_t mbar;
+
+    if (threadIdx.x == 0) {
+        init_barrier(&mbar, 1);
+    }
+    __syncthreads();
+    async_proxy_fence();
+
+    if (threadIdx.x == 0) {
+        const uint32_t bytes =
+            static_cast<uint32_t>(TILE_M * TILE_N * sizeof(bf16));
+        expect_bytes_and_arrive(&mbar, bytes);
+
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_tile, &src_map, 0, 0, &mbar);
+
+        wait(&mbar, 0);
+
+        // Asynchronously store the tile back to global memory using TMA store
+        cp_async_bulk_tensor_2d_shared_to_global(&dest_map, 0, 0, smem_tile);
+        tma_commit_group();
+        tma_wait_until_pending<0>();
+    }
 }
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_store(bf16 *src, bf16 *dest) {
-    /* TODO: your launch code here... */
+    CUtensorMap src_map;
+    CUtensorMap dest_map;
+
+    constexpr cuuint32_t rank = 2;
+    const cuuint64_t globalDim[rank] = {static_cast<cuuint64_t>(TILE_N),
+                                        static_cast<cuuint64_t>(TILE_M)};
+    const cuuint64_t globalStrides[rank - 1] = {
+        static_cast<cuuint64_t>(TILE_N * sizeof(bf16))};
+    const cuuint32_t boxDim[rank] = {static_cast<cuuint32_t>(TILE_N),
+                                     static_cast<cuuint32_t>(TILE_M)};
+    const cuuint32_t elementStrides[rank] = {1, 1};
+
+    CUDA_CHECK(cuInit(0));
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, src, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, dest, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    single_tma_store<TILE_M, TILE_N><<<1, 1>>>(src_map, dest_map);
 }
 
 /// <--- /your code here --->
