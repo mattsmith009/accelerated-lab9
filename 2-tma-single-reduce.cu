@@ -25,7 +25,7 @@ __device__ static __forceinline__ void
 cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
     const CUtensorMap *tensor_map, int c0, int c1, const void *src) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group::reduce.add "
+        "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group "
         "[%0, {%1, %2}], [%3];\n"
         :
         : "l"(tensor_map), "r"(c0), "r"(c1),
