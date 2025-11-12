@@ -3,8 +3,8 @@
 // TL+ {"compile_flags": ["-lcuda"]}
 
 #include <cuda.h>
-#include <cuda_bf16.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "tma-interface.cuh"
 
@@ -32,7 +32,41 @@ __global__ void tma_swizzle(__grid_constant__ const CUtensorMap src_map,
     // Cast to a "shared pointer" so that it works with
     // cp_async_bulk_tensor_2d_global_to_shared.
 
-    /* TODO: your launch code here... */
+    __shared__ alignas(8) uint64_t barrier_storage;
+
+    if (threadIdx.x == 0) {
+        barrier_storage = 0;
+    }
+    __syncthreads();
+
+    const uint32_t smem_addr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_buffer));
+
+    if (threadIdx.x == 0) {
+        init_barrier(&barrier_storage, 1);
+        async_proxy_fence();
+
+        const uint32_t total_bytes =
+            static_cast<uint32_t>(TILE_M * TILE_N * sizeof(datatype));
+        expect_bytes_and_arrive(&barrier_storage, total_bytes);
+
+        cp_async_bulk_tensor_2d_global_to_shared(
+            reinterpret_cast<void *>(smem_addr), &src_map, 0, 0,
+            &barrier_storage);
+
+        wait(&barrier_storage, 0);
+    }
+    __syncthreads();
+
+    const int swizzle_selector = OFFSET & 0x3;
+
+    for (int idx = threadIdx.x; idx < TILE_M * TILE_N; idx += blockDim.x) {
+        const int chunk = idx / 16;
+        const int lane = idx % 16;
+        const int orig_chunk = chunk ^ swizzle_selector;
+        const int dest_idx = orig_chunk * 16 + lane;
+        dest[dest_idx] = smem_buffer[idx];
+    }
 }
 
 template <int TILE_M, int TILE_N, int OFFSET>
@@ -45,7 +79,25 @@ void launch_tma_swizzle(datatype *src, datatype *dest) {
      * kernel with the CU_TENSOR_MAP_SWIZZLE_64B setting.
      */
 
-    /* TODO: your launch code here... */
+    CUDA_CHECK(cuInit(0));
+
+    CUtensorMap src_map;
+
+    const cuuint64_t globalDim[2] = {static_cast<cuuint64_t>(TILE_N),
+                                     static_cast<cuuint64_t>(TILE_M)};
+    const cuuint64_t globalStrides[1] = {
+        static_cast<cuuint64_t>(TILE_N * sizeof(datatype))};
+    const cuuint32_t boxDim[2] = {static_cast<cuuint32_t>(TILE_N),
+                                  static_cast<cuuint32_t>(TILE_M)};
+    const cuuint32_t elementStrides[2] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, src, globalDim,
+        globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    tma_swizzle<TILE_M, TILE_N, OFFSET><<<1, 32>>>(src_map, dest);
 }
 
 /// <--- your code here --->
